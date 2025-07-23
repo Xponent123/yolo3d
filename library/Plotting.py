@@ -92,6 +92,11 @@ def plot_3d_box(img, cam_to_img, ry, dimension, center):
     box_3d = []
     for corner in corners:
         point = project_3d_pt(corner, cam_to_img)
+        print(f"point {point} corner {corner}")
+        point[0] =(int)(point[0]*1241/640)
+        point[1] =(int)(point[1]*376/224)
+        # point[0] =(int)(point[0])
+        # point[1] =(int)(point[1])
         box_3d.append(point)
 
     #LINE
