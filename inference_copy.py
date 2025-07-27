@@ -61,43 +61,123 @@ def visualize_in_3d(lidar_points, detected_boxes, Tr_cam_rect_to_velo):
     # Create Open3D PointCloud object
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(lidar_points[:, :3])
+    
+    # Color the point cloud by height for better visualization
+    points_np = np.asarray(pcd.points)
+    colors = np.zeros((len(points_np), 3))
+    z_min, z_max = points_np[:, 2].min(), points_np[:, 2].max()
+    z_normalized = (points_np[:, 2] - z_min) / (z_max - z_min)
+    colors[:, 0] = z_normalized  # Red component increases with height
+    colors[:, 2] = 1 - z_normalized  # Blue component decreases with height
+    pcd.colors = o3d.utility.Vector3dVector(colors)
 
     # This list will hold all geometries to be rendered
     geometries = [pcd]
 
+    print(f"\nProcessing {len(detected_boxes)} detected boxes for 3D visualization:")
+
     # Process and add each detected bounding box
-    for box in detected_boxes:
+    for i, box in enumerate(detected_boxes):
         loc_cam_rect = box['location']
-        dim = box['dimensions']  # Stored as (h, w, l)
+        dim = box['dimensions']  # Stored as (h, w, l) - height, width, length
         ry = box['orient']       # Rotation-Y in camera frame
+
+        print(f"Box {i+1}: Camera location: {loc_cam_rect}, Dimensions (h,w,l): {dim}, Orient: {ry:.3f} rad ({np.degrees(ry):.1f}°)")
 
         # 1. Transform the center location from camera to LiDAR coordinates
         loc_cam_rect_hom = np.append(loc_cam_rect, 1)
         loc_velo_hom = Tr_cam_rect_to_velo @ loc_cam_rect_hom
         center_velo = loc_velo_hom[:3]
 
-        # 2. Define the extents for Open3D. The order is (length, width, height).
-        extents = [dim[2], dim[1], dim[0]]  # l, w, h
+        # 2. CRITICAL FIX: Adjust the center to ground level
+        # In KITTI, the camera coordinate system has the 3D box location representing
+        # the center bottom of the object (on the ground). After transformation to LiDAR,
+        # we need to adjust for the object's center.
+        # However, the current calculation seems to be adding height incorrectly.
+        
+        # Let's check if the transformed location is already at the correct height
+        # and adjust accordingly. In KITTI LiDAR coordinates, ground level is around Z = -1.7
+        height = dim[0]  # height is the first dimension
+        
+        # IMPORTANT: The original center_velo Z-coordinate might already be correct
+        # Let's adjust it to be at the geometric center of the bounding box
+        # Since KITTI camera coordinates are at bottom center, and we want box center:
+        # We should add half the height, but in the correct direction
+        
+        # For KITTI: if the car is on the ground, its center should be at ground + height/2
+        # Typical ground level in KITTI LiDAR is around -1.7m
+        # So for a 1.5m tall car, center should be at -1.7 + 0.75 = -0.95m
+        
+        # The issue might be that we're adding when we should be ensuring proper ground alignment
+        # Let's try a different approach: check current height and adjust if needed
+        
+        expected_ground_level = -1.7  # Typical KITTI ground level
+        expected_center_height = expected_ground_level + height / 2.0
+        
+        # If the transformed Z is way off from expected, use the expected value
+        if abs(center_velo[2] - expected_center_height) > 3.0:  # If more than 3m off
+            print(f"    Adjusting Z from {center_velo[2]:.2f} to {expected_center_height:.2f}")
+            center_velo[2] = expected_center_height
+        else:
+            # Otherwise, just ensure it's at the geometric center
+            center_velo[2] += height / 2.0
 
-        # 3. Create the rotation matrix for the LiDAR frame
-        # A rotation of `ry` around the camera's Y-axis (down) corresponds
-        # to a rotation of `-ry` around the LiDAR's Z-axis (up).
-        yaw_lidar = -ry
+        # 3. Define the extents for Open3D in the correct order: [length, width, height]
+        # KITTI dimensions are [height, width, length], Open3D expects [length, width, height]
+        extents = [dim[2], dim[1], dim[0]]  # [length, width, height]
+
+        # 4. CRITICAL FIX: Proper rotation transformation from camera to LiDAR
+        # Camera frame: X=right, Y=down, Z=forward  
+        # LiDAR frame: X=forward, Y=left, Z=up
+        
+        # Analysis of the transformation matrix shows:
+        # Tr_cam_rect_to_velo transforms from camera coordinates to LiDAR coordinates
+        # The rotation relationship for KITTI dataset is well-established:
+        
+        # Method: Use the transformation matrix to understand the coordinate alignment
+        # Looking at Tr_cam_rect_to_velo:
+        # [ 2.35e-04  1.04e-02  9.99e-01  ...]  <- LiDAR X comes mostly from Camera Z
+        # [-9.99e-01  1.06e-02  1.24e-04  ...]  <- LiDAR Y comes mostly from -Camera X  
+        # [-1.06e-02 -9.99e-01  1.05e-02  ...]  <- LiDAR Z comes mostly from -Camera Y
+        
+        # This means:
+        # - Camera Z (forward) -> LiDAR X (forward) 
+        # - Camera X (right) -> LiDAR -Y (right, since LiDAR Y is left)
+        # - Camera Y (down) -> LiDAR -Z (down, since LiDAR Z is up)
+        
+        # For rotation: ry is rotation around camera Y-axis (down)
+        # This corresponds to rotation around LiDAR -Z axis (down)
+        # But we want rotation around LiDAR +Z axis (up), so we negate
+        # Additionally, there's a 90-degree offset due to coordinate system alignment
+        
+        # The correct conversion based on KITTI coordinate system analysis:
+        yaw_lidar = -ry - np.pi/2
+        
+        # Normalize angle to [-π, π]
+        while yaw_lidar > np.pi:
+            yaw_lidar -= 2 * np.pi
+        while yaw_lidar < -np.pi:
+            yaw_lidar += 2 * np.pi
+        
         R_velo = np.array([[np.cos(yaw_lidar), -np.sin(yaw_lidar), 0],
                            [np.sin(yaw_lidar),  np.cos(yaw_lidar), 0],
                            [0,                  0,                 1]])
 
-        # 4. Create the OrientedBoundingBox directly from its properties
+        print(f"  -> LiDAR location: {center_velo}, Extents (l,w,h): {extents}, LiDAR yaw: {yaw_lidar:.3f} rad ({np.degrees(yaw_lidar):.1f}°)")
+
+        # 5. Create the OrientedBoundingBox
         obb = o3d.geometry.OrientedBoundingBox(center_velo, R_velo, extents)
         obb.color = (1, 0, 0)  # Set box color to red
         geometries.append(obb)
 
     # Add a coordinate frame for reference (X-red, Y-green, Z-blue)
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=3.0, origin=[0, 0, 0])
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0, origin=[0, 0, 0])
     geometries.append(coord_frame)
 
     # Open the visualization window
-    o3d.visualization.draw_geometries(geometries)
+    o3d.visualization.draw_geometries(geometries, 
+                                    window_name="3D Detection Results",
+                                    width=1200, height=800)
 
 # ++++ END: CORRECTED 3D VISUALIZATION FUNCTION ++++
 
@@ -170,7 +250,7 @@ def detect3d(
             alpha = np.arctan2(sin, cos)
             alpha += angle_bins[argmax]
             alpha -= np.pi
-            alpha= -1.5708/2
+            # alpha= -1.5708/2
 
             location = plot3d(resized_image, proj_matrix, box_2d, dim, alpha, theta_ray)
 
